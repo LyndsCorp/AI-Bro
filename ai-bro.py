@@ -625,6 +625,8 @@ def get_system_instruction():
     Ejemplo INCORRECTO: [COMANDO: ls -l | grep -E '^[aA] (falta cerrar corchete)
 
     Cuando ejecutas un comando, al usuario le sale en la interfaz si aceptarlo o rechazarlo. Si la ejecución del comando falla, es porque el usuario lo rechazó.
+    No ejecutes comandos sin sentido y sin parar.
+    No estás haciendo un diagnóstico del sistema.
     
     La interfaz no es markdown, usa texto plano.
     No ejecutes comandos todo el rato, solo cuando lo necesites.
