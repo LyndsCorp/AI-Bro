@@ -156,6 +156,14 @@ def is_safe_path(command_string):
                 return False
     return True
 
+def validate_command_syntax(command):
+    """Valida que el comando tenga sintaxis de shell correcta (comillas balanceadas)."""
+    try:
+        shlex.split(command)
+        return True, ""
+    except ValueError as e:
+        return False, str(e)
+
 def execute_safely(command):
     global auto_approve_commands
 
@@ -600,25 +608,24 @@ def get_system_instruction():
     prefs = config.get("preferences", "")
     prefs_text = f"\nPreferencias específicas del usuario a seguir SIEMPRE: {prefs}" if prefs else ""
 
-    # Usar llaves dobles {{ }} para escapar las llaves literales en el ejemplo C++
     return f"""
     Eres un asistente de terminal avanzado.
     El directorio de trabajo actual (PWD) del usuario es: {PWD}{prefs_text}
 
     Tienes la capacidad de LEER ARCHIVOS y EJECUTAR COMANDOS para obtener contexto o trabajar.
     
-    **Para comandos simples de una sola línea** usa: [COMANDO: comando_aqui]
-    **Para comandos multilínea (scripts, here-documents, sed con saltos de línea, etc.)** usa: [SCRIPT: contenido_del_script]
+    REGLAS CRÍTICAS PARA COMANDOS:
+    1. TODOS los comandos deben tener comillas balanceadas (cada ' tiene su pareja, cada " tiene su pareja)
+    2. Los corchetes [] y paréntesis () deben estar balanceados
+    3. Para comandos simples de una sola línea usa: [COMANDO: comando_aqui]
+    4. Para comandos multilínea (scripts, here-documents, sed con saltos de línea) usa: [SCRIPT: contenido]
+    5. NUNCA dejes comillas sin cerrar ni corchetes sin cerrar
+    6. Si un comando tiene pipes (|) o redirecciones, asegúrate de que cada parte sea sintácticamente correcta
     
-    Ejemplo de SCRIPT:
-    [SCRIPT: 
-    sed -i '34c\\    connect(m_runner, &Runner::outputReady, this, (const QString &output) {{
-        qDebug() << "Output:" << output;
-    }});' src/MainWindow.cpp
-    ]
-
-    Asegúrate de que todos los comandos simples tengan las comillas balanceadas.
-    La interfaz no es markdown, así que no utilices markdown, usa texto.
+    Ejemplo CORRECTO: [COMANDO: ls -l | grep -E '^[aA]']
+    Ejemplo INCORRECTO: [COMANDO: ls -l | grep -E '^[aA] (falta cerrar corchete)
+    
+    La interfaz no es markdown, usa texto plano.
     """
 
 def init_chat_provider(provider_name):
@@ -910,7 +917,7 @@ def main():
 
                     cmd_to_run = response_text[start_idx:end_idx].strip()
 
-                    # Si el comando es multilínea, ejecutarlo como script
+                    # Si el comando es multilínea, ejecutarlo como script directamente
                     if '\n' in cmd_to_run:
                         output = execute_script(cmd_to_run)
                         feedback_msg = f"Salida del sistema para el script:\n```\n{output}\n```\nAhora responde a la petición original."
@@ -918,41 +925,26 @@ def main():
                             response_text = send_message_to_provider(chat, provider, feedback_msg)
                         continue
 
-                    # Comando de una sola línea: lógica original con reintentos
-                    max_retries = 2
-                    attempt = 0
-                    while attempt <= max_retries:
-                        output = execute_safely(cmd_to_run)
-                        if "Error de sintaxis en el comando" in output or "comando mal formado" in output:
-                            attempt += 1
-                            if attempt <= max_retries:
-                                console.print("[yellow]⚠️ Comando con error de sintaxis. Pidiendo a la IA que lo corrija...[/yellow]")
-                                fix_prompt = (
-                                    f"El comando '{cmd_to_run}' tiene un error de sintaxis. "
-                                    "Por favor, regenera EXACTAMENTE el mismo comando pero con la sintaxis correcta. "
-                                    "Responde solo con [COMANDO: comando_corregido]."
-                                )
-                                with console.status("[bold magenta]Reintentando...[/bold magenta]"):
-                                    response_text = send_message_to_provider(chat, provider, fix_prompt)
-                                if "[COMANDO:" in response_text:
-                                    s = response_text.find("[COMANDO:") + 9
-                                    e = response_text.find("]", s)
-                                    if e != -1:
-                                        cmd_to_run = response_text[s:e].strip()
-                                    else:
-                                        break
-                                else:
-                                    break
-                            else:
-                                console.print("[red]❌ No se pudo corregir el comando tras varios intentos.[/red]")
-                                break
-                        else:
-                            feedback_msg = f"Salida del sistema para '{cmd_to_run}':\n```\n{output}\n```\nAhora responde a la petición original."
-                            with console.status("[bold magenta]Analizando salida...[/bold magenta]"):
-                                response_text = send_message_to_provider(chat, provider, feedback_msg)
-                            break
-                    if attempt > max_retries:
-                        break
+                    # Validar sintaxis de comando simple
+                    valid, error_msg = validate_command_syntax(cmd_to_run)
+                    if not valid:
+                        # Intento automático de reparación pidiendo a la IA que corrija el error exacto
+                        console.print(f"[yellow]⚠️ Comando con error de sintaxis: {error_msg}. Pidiendo corrección a la IA...[/yellow]")
+                        fix_prompt = (
+                            f"El comando que enviaste tiene un error de sintaxis de shell: {error_msg}\n"
+                            f"Comando problemático: {cmd_to_run}\n"
+                            "Corrige el error (cierra comillas/corchetes según sea necesario) y responde SOLO con [COMANDO: comando_corregido]"
+                        )
+                        with console.status("[bold magenta]Reintentando...[/bold magenta]"):
+                            response_text = send_message_to_provider(chat, provider, fix_prompt)
+                        # Vuelve a empezar el bucle para procesar el nuevo comando
+                        continue
+
+                    # Si el comando es sintácticamente correcto, ejecutar normalmente
+                    output = execute_safely(cmd_to_run)
+                    feedback_msg = f"Salida del sistema para '{cmd_to_run}':\n```\n{output}\n```\nAhora responde a la petición original."
+                    with console.status("[bold magenta]Analizando salida...[/bold magenta]"):
+                        response_text = send_message_to_provider(chat, provider, feedback_msg)
 
                 elif "[SCRIPT:" in response_text:
                     start_idx = response_text.find("[SCRIPT:") + 8
