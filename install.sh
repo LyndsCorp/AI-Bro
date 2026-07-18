@@ -43,6 +43,8 @@ if [ "$NoInstalar" == "0" ]; then
 
     ln -s /opt/ai-bro/ai-bro.py /usr/bin/ai-bro
 
+    echo "Creando Python venv en /opt/ai-bro/venv"
+
     python3 -m venv /opt/ai-bro/venv
     source /opt/ai-bro/venv/bin/activate
     Dependencias=$(cat full-requirements.txt)
