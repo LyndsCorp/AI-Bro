@@ -55,7 +55,7 @@ def is_ollama_installed():
         return False
 
 # --- CONFIGURACIÓN Y RUTAS ---
-CONFIG_DIR = os.path.expanduser("~/.config/gemini-cli")
+CONFIG_DIR = os.path.expanduser("~/.config/ai-bro")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 PWD = os.getcwd()
 console = Console()
