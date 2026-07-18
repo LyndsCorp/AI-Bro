@@ -3,7 +3,7 @@ import os
 import sys
 import json
 import subprocess
-import shlex
+import re
 import google.generativeai as genai
 from rich.console import Console
 from rich.panel import Panel
@@ -44,7 +44,6 @@ except ImportError:
 
 # --- DETECCIÓN DE OLLAMA ---
 def is_ollama_installed():
-    """Verifica si Ollama está instalado (librería Python y/o comando ollama)."""
     if ollama_lib is not None:
         return True
     try:
@@ -139,55 +138,16 @@ def ask_apt_style(question, default="s"):
         return default.lower()
     return 's' if answer.startswith('s') else 'n'
 
-# --- SEGURIDAD Y SANDBOX ---
-def is_safe_path(command_string):
-    """Comprueba que los paths del comando estén dentro del directorio actual."""
-    try:
-        parts = shlex.split(command_string)
-    except ValueError as e:
-        console.print(f"[bold red]Error de sintaxis en el comando: {e}[/bold red]")
-        return False
-
-    for part in parts:
-        if part.startswith('-'): continue
-        if os.path.exists(part):
-            abs_path = os.path.abspath(part)
-            if not abs_path.startswith(PWD):
-                return False
-    return True
-
-def execute_safely(command):
-    global auto_approve_commands
-
-    console.print(f"\n[bold yellow]⚠️ La IA solicita ejecutar:[/bold yellow] [cyan]{command}[/cyan]")
-
-    if auto_approve_commands:
-        console.print("[bold green]✓ Ejecutando automáticamente (modo ss activo).[/bold green]")
-        confirm = 's'
-    else:
-        confirm = ask_apt_style("¿Permitir ejecución?", default="s")
-
-    if confirm != 's':
-        return "El usuario denegó la ejecución del comando."
-
-    if not is_safe_path(command):
-        return "Error de seguridad: Intento de acceso fuera del directorio actual (PWD) o comando mal formado."
-
-    try:
-        result = subprocess.check_output(command, shell=True, stderr=subprocess.STDOUT, timeout=10)
-        return result.decode('utf-8')
-    except subprocess.CalledProcessError as e:
-        return f"Error al ejecutar el comando. Salida: {e.output.decode('utf-8')}"
-    except Exception as e:
-        return f"Error del sistema: {str(e)}"
-
+# --- EJECUCIÓN DE SCRIPTS (UNIFICADA) ---
 def execute_script(script_content):
-    """Ejecuta un script bash guardándolo en un archivo temporal dentro de PWD."""
+    """Guarda y ejecuta un script bash en PWD, devuelve su salida."""
     global auto_approve_commands
 
-    console.print(f"\n[bold yellow]📜 La IA solicita ejecutar un script multilínea.[/bold yellow]")
+    preview = script_content.strip().split('\n')[0][:100]
+    console.print(f"\n[bold yellow]📜 Ejecutando script:[/bold yellow] [cyan]{preview}...[/cyan]")
+
     if auto_approve_commands:
-        console.print("[bold green]✓ Ejecutando automáticamente (modo ss activo).[/bold green]")
+        console.print("[bold green]✓ Automático (modo ss activo).[/bold green]")
         confirm = 's'
     else:
         confirm = ask_apt_style("¿Permitir ejecución del script?", default="s")
@@ -213,6 +173,30 @@ def execute_script(script_content):
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+# --- EXTRACCIÓN DE SCRIPTS DE LA RESPUESTA ---
+def process_ai_response(text):
+    """
+    Busca todas las etiquetas [SCRIPT: ...] y ejecuta su contenido.
+    Devuelve el texto sin las etiquetas y un feedback con las salidas.
+    """
+    pattern = r'\[SCRIPT:\s*(.*?)\s*\]'
+    matches = re.findall(pattern, text, re.DOTALL)
+    if not matches:
+        return text, None
+
+    outputs = []
+    clean_text = re.sub(pattern, '', text, flags=re.DOTALL).strip()
+
+    for i, script in enumerate(matches):
+        script = script.strip()
+        if not script:
+            continue
+        out = execute_script(script)
+        outputs.append(f"Salida del script {i+1}:\n{out}")
+
+    feedback = "\n\n".join(outputs)
+    return clean_text, feedback
 
 # --- MANEJO DE API KEY ---
 def handle_api_key():
@@ -240,16 +224,8 @@ def handle_api_key():
             return True
     return False
 
-# --- SELECTOR INTERACTIVO MEJORADO ---
+# --- SELECTOR INTERACTIVO ---
 def interactive_select(options, title="Selecciona una opción"):
-    """
-    Selector interactivo con navegación por flechas y colores.
-    Soporta:
-      - string simple
-      - (id, label)
-      - (id, label, descripcion)
-      - (id, lista_de_segmentos) donde cada segmento es (style_class, texto)
-    """
     if not options:
         return None
 
@@ -604,29 +580,17 @@ def get_system_instruction():
     Eres un asistente de terminal avanzado.
     El directorio de trabajo actual (PWD) del usuario es: {PWD}{prefs_text}
 
-    Tienes la capacidad de LEER ARCHIVOS y EJECUTAR COMANDOS (como cat, ls, grep, echo o incluso git) para obtener contexto o trabajar.
-    
-    **Para comandos simples de una sola línea** debes responder EXACTAMENTE con esta sintaxis:
-    [COMANDO: comando_aqui]
-    Ejemplo: [COMANDO: cat main.py]
-
-    **Para comandos que ocupen varias líneas (scripts, here‑documents, o varios comandos encadenados)** debes usar esta sintaxis:
-    [SCRIPT: contenido_del_script_sin_etiquetas_adicionales]
-    Ejemplo:
-    [SCRIPT: 
-    cat > archivo.txt << 'EOF'
-    línea 1
-    línea 2
-    EOF
-    echo "Hecho"
+    Puedes ejecutar comandos y scripts de Bash. Para ello debes encerrar el código exacto entre [SCRIPT: y ].
+    Ejemplos:
+    [SCRIPT: cat main.py]
+    [SCRIPT:
+    for i in *.txt; do
+        echo "Procesando $i"
+    done
     ]
-
-    El sistema interceptará la etiqueta, ejecutará lo solicitado y te devolverá la salida como un nuevo mensaje de usuario.
-    Una vez que tengas la información, genera tu respuesta final normalmente sin usar las etiquetas.
-
-    Asegúrate de que todos los comandos simples tengan las comillas balanceadas.
-    Cuando uses [SCRIPT:] no pongas el propio script entre comillas extra, solo escribe el código Bash tal cual.
-    La interfaz no es markdown, así que no utilices markdown, usa texto.
+    Todo lo que pongas dentro de [SCRIPT: ... ] se guardará como un script y se ejecutará. No uses comillas adicionales, solo el código.
+    El sistema te devolverá la salida. Luego continúa tu respuesta.
+    La interfaz es solo texto, no uses formato Markdown fuera de los scripts.
     """
 
 def init_chat_provider(provider_name):
@@ -906,70 +870,25 @@ def main():
 
             # Envío a la IA
             provider = config.get("provider", "gemini")
-            with console.status("[bold cyan]Pensando...[/bold cyan]"):
-                response_text = send_message_to_provider(chat, provider, user_input)
+            response_text = send_message_to_provider(chat, provider, user_input)
 
-            # Procesar comandos o scripts que la IA solicite ejecutar
-            while True:
-                if "[COMANDO:" in response_text:
-                    start_idx = response_text.find("[COMANDO:") + 9
-                    end_idx = response_text.find("]", start_idx)
-                    if end_idx == -1: break
-
-                    cmd_to_run = response_text[start_idx:end_idx].strip()
-                    max_retries = 2
-                    attempt = 0
-                    while attempt <= max_retries:
-                        output = execute_safely(cmd_to_run)
-                        if "Error de sintaxis en el comando" in output or "comando mal formado" in output:
-                            attempt += 1
-                            if attempt <= max_retries:
-                                console.print("[yellow]⚠️ Comando con error de sintaxis. Pidiendo a la IA que lo corrija...[/yellow]")
-                                fix_prompt = (
-                                    f"El comando '{cmd_to_run}' tiene un error de sintaxis (probablemente comillas sin cerrar). "
-                                    "Por favor, regenera EXACTAMENTE el mismo comando pero con la sintaxis correcta. "
-                                    "Responde solo con [COMANDO: comando_corregido]."
-                                )
-                                with console.status("[bold magenta]Reintentando...[/bold magenta]"):
-                                    response_text = send_message_to_provider(chat, provider, fix_prompt)
-                                if "[COMANDO:" in response_text:
-                                    s = response_text.find("[COMANDO:") + 9
-                                    e = response_text.find("]", s)
-                                    if e != -1:
-                                        cmd_to_run = response_text[s:e].strip()
-                                    else:
-                                        break
-                                else:
-                                    break
-                            else:
-                                console.print("[red]❌ No se pudo corregir el comando tras varios intentos.[/red]")
-                                break
-                        else:
-                            feedback_msg = f"Salida del sistema para '{cmd_to_run}':\n```\n{output}\n```\nAhora responde a la petición original."
-                            with console.status("[bold magenta]Analizando salida...[/bold magenta]"):
-                                response_text = send_message_to_provider(chat, provider, feedback_msg)
-                            break
-                    if attempt > max_retries:
-                        break
-
-                elif "[SCRIPT:" in response_text:
-                    start_idx = response_text.find("[SCRIPT:") + 8
-                    end_idx = response_text.find("]", start_idx)
-                    if end_idx == -1: break
-
-                    script_content = response_text[start_idx:end_idx].strip()
-                    output = execute_script(script_content)
-                    feedback_msg = f"Salida del sistema para el script:\n```\n{output}\n```\nAhora responde a la petición original."
-                    with console.status("[bold magenta]Analizando salida del script...[/bold magenta]"):
-                        response_text = send_message_to_provider(chat, provider, feedback_msg)
-
+            # Procesar scripts en la respuesta
+            while "[SCRIPT:" in response_text:
+                clean_text, feedback = process_ai_response(response_text)
+                if feedback:
+                    # Reenviar salida a la IA para que continúe
+                    response_text = send_message_to_provider(chat, provider,
+                        f"Salida del sistema:\n{feedback}\n\nAhora responde a la petición original.")
                 else:
+                    response_text = clean_text
                     break
 
+            # Mostrar respuesta final
             if "NO TIENES CRÉDITOS" in response_text:
                 console.print(Panel(response_text, title=f"{provider.capitalize()} - ERROR", title_align="left", border_style="red"))
             else:
-                console.print(Panel(response_text, title=f"{provider.capitalize()}", title_align="left", border_style="cyan"))
+                if response_text.strip():
+                    console.print(Panel(response_text, title=f"{provider.capitalize()}", title_align="left", border_style="cyan"))
 
         except KeyboardInterrupt:
             continue
