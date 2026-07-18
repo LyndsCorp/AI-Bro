@@ -600,6 +600,7 @@ def get_system_instruction():
     prefs = config.get("preferences", "")
     prefs_text = f"\nPreferencias específicas del usuario a seguir SIEMPRE: {prefs}" if prefs else ""
 
+    # Usar llaves dobles {{ }} para escapar las llaves literales en el ejemplo C++
     return f"""
     Eres un asistente de terminal avanzado.
     El directorio de trabajo actual (PWD) del usuario es: {PWD}{prefs_text}
@@ -611,9 +612,9 @@ def get_system_instruction():
     
     Ejemplo de SCRIPT:
     [SCRIPT: 
-    sed -i '34c\    connect(m_runner, &Runner::outputReady, this, (const QString &output) {
+    sed -i '34c\\    connect(m_runner, &Runner::outputReady, this, (const QString &output) {{
         qDebug() << "Output:" << output;
-    });' src/MainWindow.cpp
+    }});' src/MainWindow.cpp
     ]
 
     Asegúrate de que todos los comandos simples tengan las comillas balanceadas.
@@ -909,13 +910,13 @@ def main():
 
                     cmd_to_run = response_text[start_idx:end_idx].strip()
 
-                    # --- NUEVO: Si el comando es multilínea, ejecutarlo como script ---
+                    # Si el comando es multilínea, ejecutarlo como script
                     if '\n' in cmd_to_run:
                         output = execute_script(cmd_to_run)
                         feedback_msg = f"Salida del sistema para el script:\n```\n{output}\n```\nAhora responde a la petición original."
                         with console.status("[bold magenta]Analizando salida...[/bold magenta]"):
                             response_text = send_message_to_provider(chat, provider, feedback_msg)
-                        continue  # vuelve a comprobar si hay más etiquetas
+                        continue
 
                     # Comando de una sola línea: lógica original con reintentos
                     max_retries = 2
@@ -950,7 +951,6 @@ def main():
                             with console.status("[bold magenta]Analizando salida...[/bold magenta]"):
                                 response_text = send_message_to_provider(chat, provider, feedback_msg)
                             break
-                    # Si se superaron los intentos, salimos del bucle de comandos para no colgar
                     if attempt > max_retries:
                         break
 
