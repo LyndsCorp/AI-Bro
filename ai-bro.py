@@ -47,7 +47,6 @@ def is_ollama_installed():
     """Verifica si Ollama está instalado (librería Python y/o comando ollama)."""
     if ollama_lib is not None:
         return True
-    # Comprobar si el comando 'ollama' existe en el sistema
     try:
         subprocess.run(["which", "ollama"], capture_output=True, check=True)
         return True
@@ -111,10 +110,8 @@ def load_config():
                     if prov not in config["providers"]:
                         config["providers"][prov] = defaults
 
-            # Si Ollama no está instalado, eliminarlo de la lista de proveedores
             if not is_ollama_installed() and "ollama" in config["providers"]:
                 del config["providers"]["ollama"]
-                # Si el proveedor actual era Ollama, cambiar a gemini
                 if config["provider"] == "ollama":
                     config["provider"] = "gemini"
 
@@ -148,7 +145,6 @@ def is_safe_path(command_string):
     try:
         parts = shlex.split(command_string)
     except ValueError as e:
-        # Comando sintácticamente inválido (p.ej. comillas sin cerrar)
         console.print(f"[bold red]Error de sintaxis en el comando: {e}[/bold red]")
         return False
 
@@ -184,6 +180,39 @@ def execute_safely(command):
         return f"Error al ejecutar el comando. Salida: {e.output.decode('utf-8')}"
     except Exception as e:
         return f"Error del sistema: {str(e)}"
+
+def execute_script(script_content):
+    """Ejecuta un script bash guardándolo en un archivo temporal dentro de PWD."""
+    global auto_approve_commands
+
+    console.print(f"\n[bold yellow]📜 La IA solicita ejecutar un script multilínea.[/bold yellow]")
+    if auto_approve_commands:
+        console.print("[bold green]✓ Ejecutando automáticamente (modo ss activo).[/bold green]")
+        confirm = 's'
+    else:
+        confirm = ask_apt_style("¿Permitir ejecución del script?", default="s")
+
+    if confirm != 's':
+        return "El usuario denegó la ejecución del script."
+
+    tmp_path = os.path.join(PWD, ".ai_bro_tmp_script.sh")
+    try:
+        with open(tmp_path, "w") as f:
+            f.write("#!/bin/bash\n")
+            f.write(script_content)
+        os.chmod(tmp_path, 0o755)
+
+        result = subprocess.check_output(
+            tmp_path, shell=False, stderr=subprocess.STDOUT, timeout=30
+        )
+        return result.decode('utf-8')
+    except subprocess.CalledProcessError as e:
+        return f"Error al ejecutar el script. Salida:\n{e.output.decode('utf-8')}"
+    except Exception as e:
+        return f"Error del sistema: {str(e)}"
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 # --- MANEJO DE API KEY ---
 def handle_api_key():
@@ -576,19 +605,28 @@ def get_system_instruction():
     El directorio de trabajo actual (PWD) del usuario es: {PWD}{prefs_text}
 
     Tienes la capacidad de LEER ARCHIVOS y EJECUTAR COMANDOS (como cat, ls, grep, echo o incluso git) para obtener contexto o trabajar.
-    Si necesitas ejecutar un comando para responder a la solicitud del usuario, DEBES responder EXACTAMENTE con esta sintaxis:
+    
+    **Para comandos simples de una sola línea** debes responder EXACTAMENTE con esta sintaxis:
+    [COMANDO: comando_aqui]
+    Ejemplo: [COMANDO: cat main.py]
 
-    [COMANDO: escribe_tu_comando_aqui]
+    **Para comandos que ocupen varias líneas (scripts, here‑documents, o varios comandos encadenados)** debes usar esta sintaxis:
+    [SCRIPT: contenido_del_script_sin_etiquetas_adicionales]
+    Ejemplo:
+    [SCRIPT: 
+    cat > archivo.txt << 'EOF'
+    línea 1
+    línea 2
+    EOF
+    echo "Hecho"
+    ]
 
-    Por ejemplo, si el usuario te pide que leas main.py, debes responder SOLO:
-    [COMANDO: cat main.py]
+    El sistema interceptará la etiqueta, ejecutará lo solicitado y te devolverá la salida como un nuevo mensaje de usuario.
+    Una vez que tengas la información, genera tu respuesta final normalmente sin usar las etiquetas.
 
-    El sistema interceptará esto, lo ejecutará y te devolverá el contenido como un nuevo mensaje de usuario.
-    Una vez que tengas la información, genera tu respuesta final normalmente sin usar la etiqueta [COMANDO].
-
-    Cuando el usuario te pide que hagas una app, te pide que lo hagas directamente en un archivo, no que se lo mandes por texto.
+    Asegúrate de que todos los comandos simples tengan las comillas balanceadas.
+    Cuando uses [SCRIPT:] no pongas el propio script entre comillas extra, solo escribe el código Bash tal cual.
     La interfaz no es markdown, así que no utilices markdown, usa texto.
-    Asegúrate de que todos los comandos que generes tengan las comillas bien balanceadas y estén sintácticamente correctos.
     """
 
 def init_chat_provider(provider_name):
@@ -871,17 +909,62 @@ def main():
             with console.status("[bold cyan]Pensando...[/bold cyan]"):
                 response_text = send_message_to_provider(chat, provider, user_input)
 
-            while "[COMANDO:" in response_text:
-                start_idx = response_text.find("[COMANDO:") + 9
-                end_idx = response_text.find("]", start_idx)
-                if end_idx == -1: break
+            # Procesar comandos o scripts que la IA solicite ejecutar
+            while True:
+                if "[COMANDO:" in response_text:
+                    start_idx = response_text.find("[COMANDO:") + 9
+                    end_idx = response_text.find("]", start_idx)
+                    if end_idx == -1: break
 
-                cmd_to_run = response_text[start_idx:end_idx].strip()
-                output = execute_safely(cmd_to_run)
-                feedback_msg = f"Salida del sistema para '{cmd_to_run}':\n```\n{output}\n```\nAhora responde a la petición original."
+                    cmd_to_run = response_text[start_idx:end_idx].strip()
+                    max_retries = 2
+                    attempt = 0
+                    while attempt <= max_retries:
+                        output = execute_safely(cmd_to_run)
+                        if "Error de sintaxis en el comando" in output or "comando mal formado" in output:
+                            attempt += 1
+                            if attempt <= max_retries:
+                                console.print("[yellow]⚠️ Comando con error de sintaxis. Pidiendo a la IA que lo corrija...[/yellow]")
+                                fix_prompt = (
+                                    f"El comando '{cmd_to_run}' tiene un error de sintaxis (probablemente comillas sin cerrar). "
+                                    "Por favor, regenera EXACTAMENTE el mismo comando pero con la sintaxis correcta. "
+                                    "Responde solo con [COMANDO: comando_corregido]."
+                                )
+                                with console.status("[bold magenta]Reintentando...[/bold magenta]"):
+                                    response_text = send_message_to_provider(chat, provider, fix_prompt)
+                                if "[COMANDO:" in response_text:
+                                    s = response_text.find("[COMANDO:") + 9
+                                    e = response_text.find("]", s)
+                                    if e != -1:
+                                        cmd_to_run = response_text[s:e].strip()
+                                    else:
+                                        break
+                                else:
+                                    break
+                            else:
+                                console.print("[red]❌ No se pudo corregir el comando tras varios intentos.[/red]")
+                                break
+                        else:
+                            feedback_msg = f"Salida del sistema para '{cmd_to_run}':\n```\n{output}\n```\nAhora responde a la petición original."
+                            with console.status("[bold magenta]Analizando salida...[/bold magenta]"):
+                                response_text = send_message_to_provider(chat, provider, feedback_msg)
+                            break
+                    if attempt > max_retries:
+                        break
 
-                with console.status("[bold magenta]Analizando salida del comando...[/bold magenta]"):
-                    response_text = send_message_to_provider(chat, provider, feedback_msg)
+                elif "[SCRIPT:" in response_text:
+                    start_idx = response_text.find("[SCRIPT:") + 8
+                    end_idx = response_text.find("]", start_idx)
+                    if end_idx == -1: break
+
+                    script_content = response_text[start_idx:end_idx].strip()
+                    output = execute_script(script_content)
+                    feedback_msg = f"Salida del sistema para el script:\n```\n{output}\n```\nAhora responde a la petición original."
+                    with console.status("[bold magenta]Analizando salida del script...[/bold magenta]"):
+                        response_text = send_message_to_provider(chat, provider, feedback_msg)
+
+                else:
+                    break
 
             if "NO TIENES CRÉDITOS" in response_text:
                 console.print(Panel(response_text, title=f"{provider.capitalize()} - ERROR", title_align="left", border_style="red"))
