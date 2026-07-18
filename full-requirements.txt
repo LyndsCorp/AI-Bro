@@ -1,0 +1,1 @@
+google-generativeai rich prompt_toolkit openai anthropic mistralai ollama
