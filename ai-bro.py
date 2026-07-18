@@ -12,11 +12,6 @@ from rich.text import Text
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.formatted_text import HTML
-from prompt_toolkit.application import Application
-from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import Layout, HSplit, Window, FormattedTextControl
-from prompt_toolkit.styles import Style
-from prompt_toolkit.patch_stdout import patch_stdout   # <--- NUEVO
 
 # Imports opcionales para otros proveedores
 try:
@@ -224,7 +219,7 @@ def handle_api_key():
             return True
     return False
 
-# --- SELECTOR INTERACTIVO ---
+# --- SELECTOR INTERACTIVO (sin cambios) ---
 def interactive_select(options, title="Selecciona una opción"):
     if not options:
         return None
@@ -287,6 +282,11 @@ def interactive_select(options, title="Selecciona una opción"):
         fragments.append(("class:hint", "  ╰── ↑↓: mover  Enter: seleccionar  Esc: cancelar\n"))
         return fragments
 
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import Layout, HSplit, Window, FormattedTextControl
+    from prompt_toolkit.styles import Style
+
     kb = KeyBindings()
 
     @kb.add("up")
@@ -347,7 +347,7 @@ def interactive_select(options, title="Selecciona una opción"):
     app.run()
     return result[0]
 
-# --- CAMBIO DE PROVEEDOR ---
+# --- CAMBIO DE PROVEEDOR (sin cambios) ---
 def change_provider():
     providers = list(config["providers"].keys())
     current_provider = config.get("provider", "gemini")
@@ -408,7 +408,7 @@ def change_provider():
     console.print(f"[bold blue]✓ Proveedor cambiado a: {selected}[/bold blue]")
     return True
 
-# --- CAMBIO DE MODELO ---
+# --- CAMBIO DE MODELO (sin cambios) ---
 def list_and_change_model():
     provider = config.get("provider", "gemini")
     current_model = config["providers"][provider].get("model", "")
@@ -700,7 +700,7 @@ def send_message_to_provider(chat_obj, provider_name, message):
             return f"[bold red]⚠️ NO TIENES CRÉDITOS PARA ESTE MODELO[/bold red]\n\n[yellow]Detalles del error:[/yellow]\n{error_msg}"
         return f"[bold red]Error ({error_type}):[/bold red]\n{error_msg}"
 
-# --- CONFIGURACIÓN INICIAL GUIADA ---
+# --- CONFIGURACIÓN INICIAL GUIADA (sin cambios) ---
 def first_run_setup():
     alguna_key = any(
         prov != "ollama" and config["providers"][prov].get("api_key")
@@ -771,7 +771,7 @@ class CommandCompleter(Completer):
             if cmd_check.startswith(prefix):
                 yield Completion(cmd, start_position=-len(word_before_cursor))
 
-# --- MOTOR PRINCIPAL (INTERFAZ CORREGIDA) ---
+# --- MOTOR PRINCIPAL (INTERFAZ ORIGINAL RESTAURADA) ---
 def main():
     global auto_approve_commands
 
@@ -809,96 +809,92 @@ def main():
         try:
             user_input = session.prompt(HTML('\n<ansigreen><b>❯</b></ansigreen> '))
 
-            # --- ZONA PROTEGIDA: toda salida se integra en prompt_toolkit ---
-            with patch_stdout():
-                if user_input.strip() == "": continue
+            if user_input.strip() == "": continue
 
-                if user_input.lower() == "/exit": break
-                if user_input.lower() == "/help":
-                    show_help()
-                    continue
-                if user_input.lower() == "/info":
-                    show_header()
-                    continue
-                if user_input.lower() == "/clear":
-                    os.system('clear' if os.name == 'posix' else 'cls')
-                    show_header()
-                    continue
-                if user_input.lower() == "/api-key":
-                    handle_api_key()
-                    continue
-                if user_input.lower() == "/provider":
-                    if change_provider():
-                        provider = config.get("provider", "gemini")
-                        show_header()
-                        chat = init_chat_provider(provider)
-                        if not chat:
-                            console.print("[bold red]Error: No se pudo inicializar el nuevo proveedor.[/bold red]")
-                    continue
-                if user_input.lower() == "/model":
-                    if list_and_change_model():
-                        provider = config.get("provider", "gemini")
-                        show_header()
-                        chat = init_chat_provider(provider)
-                        if not chat:
-                            console.print("[bold red]Error: No se pudo inicializar con el nuevo modelo.[/bold red]")
-                    continue
-                if user_input.lower().startswith("/cmd "):
-                    cmd_to_run = user_input[5:].strip()
-                    console.print(f"[dim]Ejecutando localmente: {cmd_to_run}[/dim]")
-                    subprocess.run(cmd_to_run, shell=True)
-                    continue
-                if user_input.lower().startswith("/preferences"):
-                    args = user_input[12:].strip()
-                    if not args:
-                        console.print("[bold yellow]⚠️ Tienes que poner entre comillas tus preferencias después de /preferences.[/bold yellow]")
-                        console.print("[dim]Ejemplo: /preferences \"Haz los commits en español\"[/dim]")
-                        continue
-                    config["preferences"] = args
-                    save_config(config)
-                    console.print(f"[bold blue]✓ Preferencias guardadas:[/bold blue] {args}")
+            if user_input.lower() == "/exit": break
+            if user_input.lower() == "/help":
+                show_help()
+                continue
+            if user_input.lower() == "/info":
+                show_header()
+                continue
+            if user_input.lower() == "/clear":
+                os.system('clear' if os.name == 'posix' else 'cls')
+                show_header()
+                continue
+            if user_input.lower() == "/api-key":
+                handle_api_key()
+                continue
+            if user_input.lower() == "/provider":
+                if change_provider():
                     provider = config.get("provider", "gemini")
+                    show_header()
                     chat = init_chat_provider(provider)
+                    if not chat:
+                        console.print("[bold red]Error: No se pudo inicializar el nuevo proveedor.[/bold red]")
+                continue
+            if user_input.lower() == "/model":
+                if list_and_change_model():
+                    provider = config.get("provider", "gemini")
+                    show_header()
+                    chat = init_chat_provider(provider)
+                    if not chat:
+                        console.print("[bold red]Error: No se pudo inicializar con el nuevo modelo.[/bold red]")
+                continue
+            if user_input.lower().startswith("/cmd "):
+                cmd_to_run = user_input[5:].strip()
+                console.print(f"[dim]Ejecutando localmente: {cmd_to_run}[/dim]")
+                subprocess.run(cmd_to_run, shell=True)
+                continue
+            if user_input.lower().startswith("/preferences"):
+                args = user_input[12:].strip()
+                if not args:
+                    console.print("[bold yellow]⚠️ Tienes que poner entre comillas tus preferencias después de /preferences.[/bold yellow]")
+                    console.print("[dim]Ejemplo: /preferences \"Haz los commits en español\"[/dim]")
                     continue
-                if user_input.lower() == "/auto-approve":
-                    auto_approve_commands = not auto_approve_commands
-                    config["auto_approve"] = auto_approve_commands
-                    save_config(config)
-                    status = "[bold green]ACTIVADO[/bold green]" if auto_approve_commands else "[bold red]DESACTIVADO[/bold red]"
-                    console.print(f"[bold cyan]Modo Auto-Approve de Comandos:[/bold cyan] {status}")
-                    if auto_approve_commands:
-                        console.print("[yellow]⚠️ ADVERTENCIA: La IA ejecutará todos los comandos automáticamente. ¡Úsalo con cuidado![/yellow]")
-                    continue
-
-                # Envío a la IA
+                config["preferences"] = args
+                save_config(config)
+                console.print(f"[bold blue]✓ Preferencias guardadas:[/bold blue] {args}")
                 provider = config.get("provider", "gemini")
-                response_text = send_message_to_provider(chat, provider, user_input)
+                chat = init_chat_provider(provider)
+                continue
+            if user_input.lower() == "/auto-approve":
+                auto_approve_commands = not auto_approve_commands
+                config["auto_approve"] = auto_approve_commands
+                save_config(config)
+                status = "[bold green]ACTIVADO[/bold green]" if auto_approve_commands else "[bold red]DESACTIVADO[/bold red]"
+                console.print(f"[bold cyan]Modo Auto-Approve de Comandos:[/bold cyan] {status}")
+                if auto_approve_commands:
+                    console.print("[yellow]⚠️ ADVERTENCIA: La IA ejecutará todos los comandos automáticamente. ¡Úsalo con cuidado![/yellow]")
+                continue
 
-                # Procesar scripts en la respuesta
-                while "[SCRIPT:" in response_text:
-                    clean_text, feedback = process_ai_response(response_text)
-                    if feedback:
-                        response_text = send_message_to_provider(chat, provider,
-                            f"Salida del sistema:\n{feedback}\n\nAhora responde a la petición original.")
-                    else:
-                        response_text = clean_text
-                        break
+            # Envío a la IA
+            provider = config.get("provider", "gemini")
+            response_text = send_message_to_provider(chat, provider, user_input)
 
-                # Mostrar respuesta final
-                if "NO TIENES CRÉDITOS" in response_text:
-                    console.print(Panel(response_text, title=f"{provider.capitalize()} - ERROR", title_align="left", border_style="red"))
+            # Procesar scripts en la respuesta (sin modificar la forma de imprimir)
+            while "[SCRIPT:" in response_text:
+                clean_text, feedback = process_ai_response(response_text)
+                if feedback:
+                    response_text = send_message_to_provider(chat, provider,
+                        f"Salida del sistema:\n{feedback}\n\nAhora responde a la petición original.")
                 else:
-                    if response_text.strip():
-                        console.print(Panel(response_text, title=f"{provider.capitalize()}", title_align="left", border_style="cyan"))
+                    response_text = clean_text
+                    break
+
+            # Mostrar respuesta final como siempre
+            if "NO TIENES CRÉDITOS" in response_text:
+                console.print(Panel(response_text, title=f"{provider.capitalize()} - ERROR", title_align="left", border_style="red"))
+            else:
+                if response_text.strip():
+                    console.print(Panel(response_text, title=f"{provider.capitalize()}", title_align="left", border_style="cyan"))
 
         except KeyboardInterrupt:
             continue
         except EOFError:
             break
         except Exception as e:
-            # Errores fuera del contexto de patch_stdout? Lo envolvemos en otro patch.
-            with patch_stdout():
-                console.print(f"[bold red]Error en la comunicación: {e}[/bold red]")
+            console.print(f"[bold red]Error en la comunicación: {e}[/bold red]")
 
 if __name__ == "__main__":
     main()
