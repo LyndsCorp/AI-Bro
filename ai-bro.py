@@ -144,7 +144,14 @@ def ask_apt_style(question, default="s"):
 
 # --- SEGURIDAD Y SANDBOX ---
 def is_safe_path(command_string):
-    parts = shlex.split(command_string)
+    """Comprueba que los paths del comando estén dentro del directorio actual."""
+    try:
+        parts = shlex.split(command_string)
+    except ValueError as e:
+        # Comando sintácticamente inválido (p.ej. comillas sin cerrar)
+        console.print(f"[bold red]Error de sintaxis en el comando: {e}[/bold red]")
+        return False
+
     for part in parts:
         if part.startswith('-'): continue
         if os.path.exists(part):
@@ -168,7 +175,7 @@ def execute_safely(command):
         return "El usuario denegó la ejecución del comando."
 
     if not is_safe_path(command):
-        return "Error de seguridad: Intento de acceso fuera del directorio actual (PWD)."
+        return "Error de seguridad: Intento de acceso fuera del directorio actual (PWD) o comando mal formado."
 
     try:
         result = subprocess.check_output(command, shell=True, stderr=subprocess.STDOUT, timeout=10)
@@ -581,6 +588,7 @@ def get_system_instruction():
 
     Cuando el usuario te pide que hagas una app, te pide que lo hagas directamente en un archivo, no que se lo mandes por texto.
     La interfaz no es markdown, así que no utilices markdown, usa texto.
+    Asegúrate de que todos los comandos que generes tengan las comillas bien balanceadas y estén sintácticamente correctos.
     """
 
 def init_chat_provider(provider_name):
