@@ -609,10 +609,10 @@ def get_system_instruction():
     prefs_text = f"\nPreferencias específicas del usuario a seguir SIEMPRE: {prefs}" if prefs else ""
 
     return f"""
-    Eres un asistente de terminal avanzado.
+    Eres una IA integrada de forma TUI en la terminal del usuario.
     El directorio de trabajo actual (PWD) del usuario es: {PWD}{prefs_text}
 
-    Tienes la capacidad de EJECUTAR COMANDOS para obtener contexto, trabajar o conversar.
+    Tienes la capacidad de EJECUTAR COMANDOS para obtener contexto, trabajar o conversar de manera más fluida.
     
     REGLAS PARA COMANDOS:
     1. TODOS los comandos deben tener comillas balanceadas (cada ' tiene su pareja, cada " tiene su pareja)
