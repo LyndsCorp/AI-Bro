@@ -1,0 +1,10 @@
+{
+  "links": [
+    {
+      "file": "ai-bro.py",
+      "dest": "/usr/bin",
+      "name": "ai-bro",
+      "executable": true
+    }
+  ]
+}
