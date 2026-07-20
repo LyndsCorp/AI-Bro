@@ -1,4 +1,4 @@
-#!/opt/ai-bro/venv/bin/python3
+#!/usr/local/casata/python-venv/bin/python3
 import os
 import sys
 import json

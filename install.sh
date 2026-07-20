@@ -34,19 +34,21 @@ fi
 if [ "$NoInstalar" == "0" ]; then
     #copiar el script para que sea un comando
 
-    apt install python3-pip python3-venv
+    apt install python3 python3-pip python3-venv
 
-    mkdir /opt/ai-bro/
-    cp ai-bro.py /opt/ai-bro/ai-bro.py
+    mkdir -p /usr/local/casata/apps/ai-bro/
+    cp ai-bro.py /usr/local/casata/apps/ai-bro/ai-bro.py
 
-    chmod +x /opt/ai-bro/ai-bro.py
+    cp GUIDE.json /usr/local/casata/apps/ai-bro/GUIDE.json # para poder desinstalarse con Casata
 
-    ln -s /opt/ai-bro/ai-bro.py /usr/bin/ai-bro
+    chmod +x /usr/local/casata/apps/ai-bro/ai-bro.py
 
-    echo "Creando Python venv en /opt/ai-bro/venv"
+    ln -s /usr/local/casata/apps/ai-bro/ai-bro.py /usr/bin/ai-bro
 
-    python3 -m venv /opt/ai-bro/venv
-    source /opt/ai-bro/venv/bin/activate
+    echo "Creando Python venv en /usr/local/casata/python-venv/"
+
+    python3 -m /usr/local/casata/python-venv/
+    source /usr/local/casata/python-venv/
     Dependencias=$(cat full-requirements.txt)
     pip install $Dependencias
     exit
