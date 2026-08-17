@@ -3,7 +3,7 @@
   "version": "1.0",
   "apt": ["python3"],
   "pacman": ["python"],
-  "dnf:" ["python3"],
+  "dnf": ["python3"],
   "pip": ["google-generativeai", "rich", "prompt_toolkit", "openai", "anthropic", "mistralai", "ollama"],
   "casata": [],
   "size": "76.5 KiB",
