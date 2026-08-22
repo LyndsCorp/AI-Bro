@@ -1,4 +1,8 @@
 #!/usr/local/casata/python-venv/bin/python3
+
+# Copyright (C) 2026 David Baña Szymaniak
+# Licencia GPL v3
+
 import os
 import sys
 import json
