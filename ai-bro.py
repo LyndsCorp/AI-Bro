@@ -8,12 +8,11 @@ import sys
 import json
 import subprocess
 import shlex
+import re
 import google.generativeai as genai
 from rich.console import Console
 from rich.panel import Panel
-from rich.table import Table
 from rich.text import Text
-
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.formatted_text import HTML
@@ -48,7 +47,6 @@ except ImportError:
 
 # --- DETECCIÓN DE OLLAMA ---
 def is_ollama_installed():
-    """Verifica si Ollama está instalado (librería Python y/o comando ollama)."""
     if ollama_lib is not None:
         return True
     try:
@@ -61,6 +59,21 @@ def is_ollama_installed():
 CONFIG_DIR = os.path.expanduser("~/.config/ai-bro")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 PWD = os.getcwd()
+AI_BRO_DIR = os.path.join(PWD, ".ai-bro")
+
+# Estado global de la sesión de la IA
+ai_cwd = PWD               # Directorio virtual de trabajo de la IA (dentro de PWD)
+command_history = []       # Historial de comandos ejecutados (máx 10)
+MAX_COMMAND_HISTORY = 10
+MAX_CHAT_HISTORY = 20      # Máx mensajes en historial de chat para proveedores API
+
+# Lista blanca de comandos de solo lectura que no requieren aprobación
+SAFE_READ_COMMANDS = {"ls", "cat", "grep", "head", "tail", "wc", "find", "pwd", "tree", "sed", "awk"}
+# Nota: sed/awk pueden ser peligrosos con -i, por eso verificaremos que no tengan -i y no haya redirecciones
+
+# Patrones peligrosos que siempre requieren aprobación
+DANGEROUS_PATTERNS = [r"sudo", r"rm\s+-rf", r">\s*/", r">>\s*/", r"\bdd\b", r"\bmkfs", r"\breboot\b", r"\bshutdown\b"]
+
 console = Console()
 
 def load_config():
@@ -137,15 +150,32 @@ auto_approve_commands = config.get("auto_approve", False)
 
 # --- FUNCIONES TIPO APT ---
 def ask_apt_style(question, default="s"):
-    choices = r"\[S/n]" if default.lower() == 's' else r"\[s/N]"
+    choices = r"\[S/n/m]" if default.lower() == 's' else r"\[s/N/m]"
     answer = console.input(f"{question} {choices} ").strip().lower()
     if not answer:
         return default.lower()
-    return 's' if answer.startswith('s') else 'n'
+    if answer.startswith('s'):
+        return 's'
+    if answer.startswith('n'):
+        return 'n'
+    if answer.startswith('m'):
+        return 'm'
+    return 'n'
 
 # --- SEGURIDAD Y SANDBOX ---
-def is_safe_path(command_string):
-    """Comprueba que los paths del comando estén dentro del directorio actual."""
+def resolve_safe_path(path, cwd):
+    """Devuelve ruta absoluta si está dentro de PWD, de lo contrario None."""
+    if not path:
+        return None
+    abs_path = os.path.abspath(os.path.join(cwd, path))
+    if abs_path == PWD or abs_path.startswith(PWD + os.sep):
+        return abs_path
+    return None
+
+def is_safe_path(command_string, cwd=None):
+    """Comprueba que los paths del comando estén dentro del directorio actual (o PWD)."""
+    if cwd is None:
+        cwd = ai_cwd
     try:
         parts = shlex.split(command_string)
     except ValueError as e:
@@ -153,59 +183,260 @@ def is_safe_path(command_string):
         return False
 
     for part in parts:
-        if part.startswith('-'): continue
-        if os.path.exists(part):
-            abs_path = os.path.abspath(part)
-            if not abs_path.startswith(PWD):
+        if part.startswith('-'):
+            continue
+        # Ignorar operadores de shell
+        if part in ['|', '>', '>>', '<', '&&', '||', ';', '&']:
+            continue
+        # Si es un patrón glob, omitir
+        if any(ch in part for ch in '*?[]'):
+            continue
+        # Si parece una ruta (contiene / o existe)
+        if '/' in part or os.path.exists(os.path.join(cwd, part)):
+            abs_path = resolve_safe_path(part, cwd)
+            if abs_path is None:
                 return False
     return True
 
+def check_sudo(command_string):
+    """Detecta si el comando contiene sudo o intenta elevar privilegios."""
+    parts = shlex.split(command_string)
+    return 'sudo' in parts
+
 def validate_command_syntax(command):
-    """Valida que el comando tenga sintaxis de shell correcta (comillas balanceadas)."""
+    """Valida que el comando tenga sintaxis de shell correcta (comillas y paréntesis/corchetes balanceados)."""
     try:
         shlex.split(command)
-        return True, ""
     except ValueError as e:
         return False, str(e)
 
-def execute_safely(command):
-    global auto_approve_commands
+    # Comprobar balance de paréntesis y corchetes
+    stack = []
+    pairs = {')': '(', ']': '[', '}': '{'}
+    for ch in command:
+        if ch in '([{':
+            stack.append(ch)
+        elif ch in ')]}':
+            if not stack or stack[-1] != pairs[ch]:
+                return False, f"Paréntesis/corchetes desbalanceados en '{ch}'"
+            stack.pop()
+    if stack:
+        return False, "Paréntesis/corchetes sin cerrar"
+    return True, ""
 
-    console.print(f"\n[bold yellow]⚠️ La IA solicita ejecutar:[/bold yellow] [cyan]{command}[/cyan]")
+def is_read_only_safe_command(cmd, cwd=None):
+    """Determina si un comando es de solo lectura y seguro para ejecutar sin aprobación."""
+    if cwd is None:
+        cwd = ai_cwd
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+
+    # No permitir redirecciones, pipes, etc.
+    if any(ch in cmd for ch in ['>', '<', '|', ';', '&', '$', '`']):
+        return False
+
+    base = parts[0]
+    if base not in SAFE_READ_COMMANDS:
+        return False
+
+    # Verificar flags peligrosos (p.ej. sed -i)
+    if base in ('sed', 'awk'):
+        for p in parts[1:]:
+            if p == '-i' or p.startswith('-i'):
+                return False
+
+    # Verificar paths dentro de PWD
+    if not is_safe_path(cmd, cwd):
+        return False
+
+    # Verificar que no haya sudo
+    if 'sudo' in parts:
+        return False
+
+    return True
+
+def is_dangerous_command(cmd):
+    """Detecta patrones peligrosos que requieren aprobación."""
+    cmd_lower = cmd.lower()
+    for pattern in DANGEROUS_PATTERNS:
+        if re.search(pattern, cmd_lower):
+            return True
+    return False
+
+def is_redirect_to_ai_bro(cmd, cwd=None):
+    """Detecta si el comando redirige salida a un archivo dentro de .ai-bro/."""
+    if cwd is None:
+        cwd = ai_cwd
+    # Buscar '>' o '>>' y extraer destino
+    match = re.search(r'>>?\s*([^\s;|&]+)', cmd)
+    if not match:
+        return False
+    dest = match.group(1)
+    abs_dest = resolve_safe_path(dest, cwd)
+    if abs_dest is None:
+        return False
+    ai_bro_abs = os.path.abspath(AI_BRO_DIR)
+    return abs_dest.startswith(ai_bro_abs + os.sep) or abs_dest == ai_bro_abs
+
+def update_command_history(command, output):
+    """Registra un comando y su salida (truncada) en el historial."""
+    global command_history
+    truncated = output[:500] + ('...' if len(output) > 500 else '')
+    command_history.append({
+        'command': command,
+        'output': truncated,
+    })
+    if len(command_history) > MAX_COMMAND_HISTORY:
+        command_history.pop(0)
+
+def get_command_history_context():
+    """Devuelve un string con el historial reciente de comandos para incluir en el system prompt."""
+    if not command_history:
+        return ""
+    lines = ["\nHistorial reciente de comandos ejecutados (para evitar repeticiones):"]
+    for h in command_history[-5:]:
+        lines.append(f"- Comando: {h['command']}\n  Resultado: {h['output']}")
+    return "\n".join(lines)
+
+# --- EJECUCIÓN SEGURA ---
+def execute_command(cmd_to_run, reason=""):
+    """Ejecuta un comando de una sola línea.
+    Devuelve (output_text, status) donde status puede ser:
+      'executed', 'denied', 'modified', 'auto', 'cd', 'sudo_rejected', 'syntax_error'
+    """
+    global ai_cwd, auto_approve_commands
+
+    # 1. Rechazar sudo
+    if check_sudo(cmd_to_run) or is_dangerous_command(cmd_to_run):
+        console.print("[bold red]⛔ Comando con sudo o potencialmente peligroso bloqueado automáticamente.[/bold red]")
+        return "Error de seguridad: No se permite el uso de sudo ni comandos destructivos sin confirmación.", 'sudo_rejected'
+
+    # 2. Manejar cd virtual
+    if cmd_to_run.strip().startswith("cd"):
+        parts = shlex.split(cmd_to_run)
+        if len(parts) == 1:
+            target = PWD
+        elif len(parts) == 2:
+            target = parts[1]
+            abs_target = resolve_safe_path(target, ai_cwd)
+            if abs_target is None:
+                return "Error de seguridad: No puedes cambiar a un directorio fuera de PWD.", 'denied'
+            target = abs_target
+        else:
+            return "Error: cd solo acepta un argumento.", 'denied'
+
+        if os.path.isdir(target):
+            ai_cwd = target
+            console.print(f"[bold cyan]📁 IA cambió su directorio de trabajo a:[/bold cyan] {ai_cwd}")
+            return f"Directorio actual de la IA: {ai_cwd}", 'cd'
+        else:
+            return f"Error: El directorio {target} no existe.", 'denied'
+
+    # 3. Si es comando de solo lectura seguro -> auto ejecutar
+    if is_read_only_safe_command(cmd_to_run):
+        console.print(f"[dim]🔍 Ejecutando automáticamente (solo lectura): {cmd_to_run}[/dim]")
+        try:
+            result = subprocess.check_output(cmd_to_run, shell=True, stderr=subprocess.STDOUT,
+                                             timeout=15, cwd=ai_cwd)
+            output = result.decode('utf-8')
+            update_command_history(cmd_to_run, output)
+            return output, 'auto'
+        except subprocess.CalledProcessError as e:
+            output = e.output.decode('utf-8')
+            update_command_history(cmd_to_run, output)
+            return f"Error al ejecutar: {output}", 'auto'
+        except Exception as e:
+            return f"Error del sistema: {str(e)}", 'auto'
+
+    # 4. Si redirige a .ai-bro/ y el resto es lectura segura -> auto ejecutar
+    if is_redirect_to_ai_bro(cmd_to_run):
+        # Verificar que la parte antes de la redirección sea de lectura segura
+        before_redirect = re.split(r'>>?\s*', cmd_to_run)[0].strip()
+        if is_read_only_safe_command(before_redirect) or before_redirect.startswith('echo'):
+            console.print(f"[dim]✍️  Escribiendo en .ai-bro/ sin aprobación: {cmd_to_run}[/dim]")
+            try:
+                os.makedirs(AI_BRO_DIR, exist_ok=True)
+                result = subprocess.check_output(cmd_to_run, shell=True, stderr=subprocess.STDOUT,
+                                                 timeout=15, cwd=ai_cwd)
+                output = result.decode('utf-8')
+                update_command_history(cmd_to_run, output)
+                return output, 'auto'
+            except subprocess.CalledProcessError as e:
+                output = e.output.decode('utf-8')
+                update_command_history(cmd_to_run, output)
+                return f"Error al ejecutar: {output}", 'auto'
+            except Exception as e:
+                return f"Error del sistema: {str(e)}", 'auto'
+
+    # 5. Validar sintaxis
+    valid, error_msg = validate_command_syntax(cmd_to_run)
+    if not valid:
+        return f"Error de sintaxis: {error_msg}", 'syntax_error'
+
+    # 6. Comprobar paths
+    if not is_safe_path(cmd_to_run, ai_cwd):
+        return "Error de seguridad: Intento de acceso fuera del directorio actual o PWD.", 'denied'
+
+    # 7. Requiere aprobación
+    reason_str = f" [dim](Motivo: {reason})[/dim]" if reason else ""
+    console.print(f"\n[bold yellow]⚠️ La IA solicita ejecutar:[/bold yellow] [cyan]{cmd_to_run}[/cyan]{reason_str}")
 
     if auto_approve_commands:
-        console.print("[bold green]✓ Ejecutando automáticamente (modo ss activo).[/bold green]")
+        console.print("[bold green]✓ Ejecutando automáticamente (modo auto-approve activo).[/bold green]")
         confirm = 's'
     else:
-        confirm = ask_apt_style("¿Permitir ejecución?", default="s")
+        confirm = ask_apt_style("¿Permitir ejecución? (m = pedir modificación)", default="s")
 
+    if confirm == 'm':
+        return "__MODIFY_REQUEST__", 'modified'
     if confirm != 's':
-        return "El usuario denegó la ejecución del comando."
-
-    if not is_safe_path(command):
-        return "Error de seguridad: Intento de acceso fuera del directorio actual (PWD) o comando mal formado."
+        update_command_history(cmd_to_run, "Usuario rechazó explícitamente la ejecución.")
+        return "El usuario rechazó explícitamente la ejecución del comando.", 'denied'
 
     try:
-        result = subprocess.check_output(command, shell=True, stderr=subprocess.STDOUT, timeout=10)
-        return result.decode('utf-8')
+        result = subprocess.check_output(cmd_to_run, shell=True, stderr=subprocess.STDOUT,
+                                         timeout=20, cwd=ai_cwd)
+        output = result.decode('utf-8')
+        update_command_history(cmd_to_run, output)
+        return output, 'executed'
     except subprocess.CalledProcessError as e:
-        return f"Error al ejecutar el comando. Salida: {e.output.decode('utf-8')}"
+        output = e.output.decode('utf-8')
+        update_command_history(cmd_to_run, output)
+        return f"Error al ejecutar el comando. Salida: {output}", 'executed'
     except Exception as e:
-        return f"Error del sistema: {str(e)}"
+        return f"Error del sistema: {str(e)}", 'executed'
 
-def execute_script(script_content):
-    """Ejecuta un script bash guardándolo en un archivo temporal dentro de PWD."""
+def execute_script(script_content, reason=""):
+    """Ejecuta un script bash multilínea.
+    Devuelve (output_text, status) similar a execute_command.
+    """
     global auto_approve_commands
 
-    console.print(f"\n[bold yellow]📜 La IA solicita ejecutar un script multilínea.[/bold yellow]")
+    # Rechazar sudo
+    if 'sudo' in script_content:
+        console.print("[bold red]⛔ Script con sudo bloqueado automáticamente.[/bold red]")
+        return "Error de seguridad: No se permite el uso de sudo.", 'sudo_rejected'
+
+    # Mostrar script completo
+    reason_str = f" [dim](Motivo: {reason})[/dim]" if reason else ""
+    console.print(f"\n[bold yellow]📜 La IA solicita ejecutar un script multilínea:[/bold yellow]{reason_str}")
+    console.print(Panel(script_content, title="Contenido del script", border_style="yellow", title_align="left"))
+
     if auto_approve_commands:
-        console.print("[bold green]✓ Ejecutando automáticamente (modo ss activo).[/bold green]")
+        console.print("[bold green]✓ Ejecutando automáticamente (modo auto-approve activo).[/bold green]")
         confirm = 's'
     else:
-        confirm = ask_apt_style("¿Permitir ejecución del script?", default="s")
+        confirm = ask_apt_style("¿Permitir ejecución del script? (m = pedir modificación)", default="s")
 
+    if confirm == 'm':
+        return "__MODIFY_REQUEST__", 'modified'
     if confirm != 's':
-        return "El usuario denegó la ejecución del script."
+        update_command_history(f"[SCRIPT]\n{script_content}", "Usuario rechazó explícitamente la ejecución.")
+        return "El usuario rechazó explícitamente la ejecución del script.", 'denied'
 
     tmp_path = os.path.join(PWD, ".ai_bro_tmp_script.sh")
     try:
@@ -215,13 +446,17 @@ def execute_script(script_content):
         os.chmod(tmp_path, 0o755)
 
         result = subprocess.check_output(
-            tmp_path, shell=False, stderr=subprocess.STDOUT, timeout=30
+            tmp_path, shell=False, stderr=subprocess.STDOUT, timeout=30, cwd=ai_cwd
         )
-        return result.decode('utf-8')
+        output = result.decode('utf-8')
+        update_command_history(f"[SCRIPT]\n{script_content}", output)
+        return output, 'executed'
     except subprocess.CalledProcessError as e:
-        return f"Error al ejecutar el script. Salida:\n{e.output.decode('utf-8')}"
+        output = e.output.decode('utf-8')
+        update_command_history(f"[SCRIPT]\n{script_content}", output)
+        return f"Error al ejecutar el script. Salida:\n{output}", 'executed'
     except Exception as e:
-        return f"Error del sistema: {str(e)}"
+        return f"Error del sistema: {str(e)}", 'executed'
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
@@ -254,14 +489,6 @@ def handle_api_key():
 
 # --- SELECTOR INTERACTIVO MEJORADO ---
 def interactive_select(options, title="Selecciona una opción"):
-    """
-    Selector interactivo con navegación por flechas y colores.
-    Soporta:
-      - string simple
-      - (id, label)
-      - (id, label, descripcion)
-      - (id, lista_de_segmentos) donde cada segmento es (style_class, texto)
-    """
     if not options:
         return None
 
@@ -605,6 +832,11 @@ def show_help():
 [bold cyan]/api-key[/bold cyan]             Muestra o cambia tu API Key del proveedor actual.
 [bold cyan]/clear[/bold cyan]               Limpia todos los mensajes del contexto.
 [bold cyan]/exit[/bold cyan]                Cierra la aplicación.
+
+[bold green]Formato de comandos para la IA:[/bold green]
+  [COMANDO: comando | razon: descripción]
+  [SCRIPT: contenido | razon: descripción]
+  La razón es opcional pero ayuda al usuario a decidir.
     """
     console.print(Panel(help_text.strip(), title="Comandos Disponibles", border_style="green", title_align="left"))
 
@@ -612,29 +844,40 @@ def get_system_instruction():
     prefs = config.get("preferences", "")
     prefs_text = f"\nPreferencias específicas del usuario a seguir SIEMPRE: {prefs}" if prefs else ""
 
+    history_text = get_command_history_context()
+
     return f"""
     Eres una IA integrada de forma TUI en la terminal del usuario.
-    El directorio de trabajo actual (PWD) del usuario es: {PWD}{prefs_text}
+    El directorio de trabajo actual (PWD) del usuario es: {PWD}
+    Tu directorio de trabajo virtual actual (ai_cwd) es: {ai_cwd}
+    {prefs_text}
 
     Tienes la capacidad de EJECUTAR COMANDOS para obtener contexto, trabajar o conversar de manera más fluida.
-    
+
     REGLAS PARA COMANDOS:
     1. TODOS los comandos deben tener comillas balanceadas (cada ' tiene su pareja, cada " tiene su pareja)
     2. Los corchetes [] y paréntesis () deben estar balanceados
-    3. Para comandos simples de una sola línea usa: [COMANDO: comando_aqui]
-    4. Para comandos multilínea (sed con saltos de línea) usa: [SCRIPT: contenido]
+    3. Para comandos simples de una sola línea usa: [COMANDO: comando_aqui | razon: explicación breve]
+    4. Para comandos multilínea (sed con saltos de línea) usa: [SCRIPT: contenido | razon: explicación breve]
     5. NUNCA dejes comillas sin cerrar ni corchetes sin cerrar
-    
-    Ejemplo CORRECTO: [COMANDO: ls -l | grep -E '^[aA]']
+    6. Puedes usar 'cd' para cambiar tu directorio de trabajo virtual (dentro de PWD). No es un builtin de shell; el sistema lo maneja.
+    7. NO uses sudo ni comandos destructivos sin pensar. Se rechazarán automáticamente.
+    8. Puedes escribir archivos dentro de .ai-bro/ sin pedir aprobación (usa redirección como 'cat archivo > .ai-bro/salida'). Útil para guardar diffs o archivos temporales.
+    9. Para modificar archivos del proyecto, crea un diff en .ai-bro/ y luego usa 'patch' para aplicarlo (requerirá aprobación).
+    10. No alucines contenido de archivos. Si necesitas saber qué hay, usa comandos como cat, grep, ls, find (estos se ejecutan automáticamente).
+    11. Evita repetir comandos que ya has ejecutado recientemente. Consulta el historial a continuación.
+    12. Si el usuario rechaza un comando, no insistas con el mismo comando.
+
+    Ejemplo CORRECTO: [COMANDO: ls -l | grep -E '^[aA]' | razon: listar archivos que empiezan con a o A]
     Ejemplo INCORRECTO: [COMANDO: ls -l | grep -E '^[aA] (falta cerrar corchete)
 
-    Cuando ejecutas un comando, al usuario le sale en la interfaz si aceptarlo o rechazarlo. Si la ejecución del comando falla, es porque el usuario lo rechazó.
+    Cuando ejecutas un comando, al usuario le sale en la interfaz si aceptarlo o rechazarlo. Si la ejecución del comando falla, es porque el usuario lo rechazó o hubo un error.
     No ejecutes comandos sin sentido y sin parar.
     No estás haciendo un diagnóstico del sistema.
-    
+
     La interfaz no es markdown, usa texto plano.
     No ejecutes comandos todo el rato, solo cuando lo necesites.
-    No puedes usar el comando cd, tienes que hacerlo todo desde tu pwd.
+    {history_text}
     """
 
 def init_chat_provider(provider_name):
@@ -703,7 +946,9 @@ def send_message_to_provider(chat_obj, provider_name, message):
 
         elif provider_name in ["openai", "deepseek", "ollama"]:
             messages = [{"role": "system", "content": get_system_instruction()}]
-            messages.extend(chat_obj["history"])
+            # Limitar historial para evitar desbordar contexto
+            history = chat_obj["history"][-MAX_CHAT_HISTORY:]
+            messages.extend(history)
             messages.append({"role": "user", "content": message})
             response = chat_obj["client"].chat.completions.create(
                 model=chat_obj["model"],
@@ -712,29 +957,38 @@ def send_message_to_provider(chat_obj, provider_name, message):
             assistant_message = response.choices[0].message.content
             chat_obj["history"].append({"role": "user", "content": message})
             chat_obj["history"].append({"role": "assistant", "content": assistant_message})
+            # Mantener solo los últimos MAX_CHAT_HISTORY mensajes
+            if len(chat_obj["history"]) > MAX_CHAT_HISTORY:
+                chat_obj["history"] = chat_obj["history"][-MAX_CHAT_HISTORY:]
             return assistant_message
 
         elif provider_name == "claude":
             chat_obj["history"].append({"role": "user", "content": message})
+            history = chat_obj["history"][-MAX_CHAT_HISTORY:]
             response = chat_obj["client"].messages.create(
                 model=chat_obj["model"],
                 max_tokens=2048,
                 system=get_system_instruction(),
-                messages=chat_obj["history"]
+                messages=history
             )
             assistant_message = response.content[0].text
             chat_obj["history"].append({"role": "assistant", "content": assistant_message})
+            if len(chat_obj["history"]) > MAX_CHAT_HISTORY:
+                chat_obj["history"] = chat_obj["history"][-MAX_CHAT_HISTORY:]
             return assistant_message
 
         elif provider_name == "mistral":
             chat_obj["history"].append({"role": "user", "content": message})
             system_message = {"role": "system", "content": get_system_instruction()}
+            history = chat_obj["history"][-MAX_CHAT_HISTORY:]
             response = chat_obj["client"].chat.complete(
                 model=chat_obj["model"],
-                messages=[system_message] + chat_obj["history"]
+                messages=[system_message] + history
             )
             assistant_message = response.choices[0].message.content
             chat_obj["history"].append({"role": "assistant", "content": assistant_message})
+            if len(chat_obj["history"]) > MAX_CHAT_HISTORY:
+                chat_obj["history"] = chat_obj["history"][-MAX_CHAT_HISTORY:]
             return assistant_message
 
     except Exception as e:
@@ -794,7 +1048,7 @@ def first_run_setup():
 def show_header():
     provider = config.get("provider", "gemini")
     model = config["providers"][provider].get("model", "N/A")
-    header = Text(f" AI Bro  |  PWD: {PWD}  |  Provider: {provider}  |  Modelo: {model} ", justify="center", style="bold cyan")
+    header = Text(f" AI Bro  |  PWD: {PWD}  |  AI CWD: {ai_cwd}  |  Provider: {provider}  |  Modelo: {model} ", justify="center", style="bold cyan")
     console.print(Panel(header, expand=True, border_style="cyan"))
 
 # --- COMPLETADOR PERSONALIZADO ---
@@ -817,7 +1071,7 @@ class CommandCompleter(Completer):
 
 # --- MOTOR PRINCIPAL ---
 def main():
-    global auto_approve_commands
+    global auto_approve_commands, ai_cwd
 
     os.system('clear' if os.name == 'posix' else 'cls')
 
@@ -835,27 +1089,24 @@ def main():
         sys.exit(1)
 
     comandos = [
-        "/help",
-        "/info",
-        "/cmd",
-        "/preferences",
-        "/auto-approve",
-        "/provider",
-        "/model",
-        "/api-key",
-        "/clear",
-        "/exit"
+        "/help", "/info", "/cmd", "/preferences", "/auto-approve",
+        "/provider", "/model", "/api-key", "/clear", "/exit"
     ]
     completer = CommandCompleter(comandos, ignore_case=True)
     session = PromptSession(completer=completer, complete_while_typing=True)
+
+    # Crear .ai-bro si no existe
+    os.makedirs(AI_BRO_DIR, exist_ok=True)
 
     while True:
         try:
             user_input = session.prompt(HTML('\n<ansigreen><b>❯</b></ansigreen> '))
 
-            if user_input.strip() == "": continue
+            if user_input.strip() == "":
+                continue
 
-            if user_input.lower() == "/exit": break
+            if user_input.lower() == "/exit":
+                break
             if user_input.lower() == "/help":
                 show_help()
                 continue
@@ -888,7 +1139,7 @@ def main():
             if user_input.lower().startswith("/cmd "):
                 cmd_to_run = user_input[5:].strip()
                 console.print(f"[dim]Ejecutando localmente: {cmd_to_run}[/dim]")
-                subprocess.run(cmd_to_run, shell=True)
+                subprocess.run(cmd_to_run, shell=True, cwd=PWD)
                 continue
             if user_input.lower().startswith("/preferences"):
                 args = user_input[12:].strip()
@@ -896,6 +1147,9 @@ def main():
                     console.print("[bold yellow]⚠️ Tienes que poner entre comillas tus preferencias después de /preferences.[/bold yellow]")
                     console.print("[dim]Ejemplo: /preferences \"Haz los commits en español\"[/dim]")
                     continue
+                # Limpiar comillas externas si las hay
+                if len(args) >= 2 and args[0] in ('"', "'") and args[-1] in ('"', "'"):
+                    args = args[1:-1]
                 config["preferences"] = args
                 save_config(config)
                 console.print(f"[bold blue]✓ Preferencias guardadas:[/bold blue] {args}")
@@ -918,57 +1172,135 @@ def main():
                 response_text = send_message_to_provider(chat, provider, user_input)
 
             # Procesar comandos o scripts que la IA solicite ejecutar
-            while True:
-                if "[COMANDO:" in response_text:
-                    start_idx = response_text.find("[COMANDO:") + 9
-                    end_idx = response_text.find("]", start_idx)
-                    if end_idx == -1: break
+            # Se procesan todos los comandos/scripts en la respuesta antes de enviar feedback final.
+            max_iterations = 5
+            iteration = 0
 
-                    cmd_to_run = response_text[start_idx:end_idx].strip()
+            while iteration < max_iterations:
+                iteration += 1
 
-                    # Si el comando es multilínea, ejecutarlo como script directamente
-                    if '\n' in cmd_to_run:
-                        output = execute_script(cmd_to_run)
-                        feedback_msg = f"Salida del sistema para el script:\n```\n{output}\n```\nAhora responde a la petición original."
-                        with console.status("[bold magenta]Analizando salida...[/bold magenta]"):
-                            response_text = send_message_to_provider(chat, provider, feedback_msg)
-                        continue
+                # Buscar comandos con formato [COMANDO: ... | razon: ...]
+                command_match = re.search(r'\[COMANDO:\s*(.*?)\]', response_text, re.DOTALL)
+                script_match = re.search(r'\[SCRIPT:\s*(.*?)\]', response_text, re.DOTALL)
 
-                    # Validar sintaxis de comando simple
-                    valid, error_msg = validate_command_syntax(cmd_to_run)
-                    if not valid:
-                        # Intento automático de reparación pidiendo a la IA que corrija el error exacto
-                        console.print(f"[yellow]⚠️ Comando con error de sintaxis: {error_msg}. Pidiendo corrección a la IA...[/yellow]")
-                        fix_prompt = (
-                            f"El comando que enviaste tiene un error de sintaxis de shell: {error_msg}\n"
-                            f"Comando problemático: {cmd_to_run}\n"
-                            "Corrige el error (cierra comillas/corchetes según sea necesario) y responde SOLO con [COMANDO: comando_corregido]"
-                        )
-                        with console.status("[bold magenta]Reintentando...[/bold magenta]"):
-                            response_text = send_message_to_provider(chat, provider, fix_prompt)
-                        # Vuelve a empezar el bucle para procesar el nuevo comando
-                        continue
-
-                    # Si el comando es sintácticamente correcto, ejecutar normalmente
-                    output = execute_safely(cmd_to_run)
-                    feedback_msg = f"Salida del sistema para '{cmd_to_run}':\n```\n{output}\n```\nAhora responde a la petición original."
-                    with console.status("[bold magenta]Analizando salida...[/bold magenta]"):
-                        response_text = send_message_to_provider(chat, provider, feedback_msg)
-
-                elif "[SCRIPT:" in response_text:
-                    start_idx = response_text.find("[SCRIPT:") + 8
-                    end_idx = response_text.find("]", start_idx)
-                    if end_idx == -1: break
-
-                    script_content = response_text[start_idx:end_idx].strip()
-                    output = execute_script(script_content)
-                    feedback_msg = f"Salida del sistema para el script:\n```\n{output}\n```\nAhora responde a la petición original."
-                    with console.status("[bold magenta]Analizando salida del script...[/bold magenta]"):
-                        response_text = send_message_to_provider(chat, provider, feedback_msg)
-
-                else:
+                if not command_match and not script_match:
                     break
 
+                if command_match:
+                    full_block = command_match.group(0)
+                    content = command_match.group(1).strip()
+                    # Separar comando y razón
+                    reason = ""
+                    if '| razon:' in content:
+                        cmd_part, reason_part = content.split('| razon:', 1)
+                        cmd_to_run = cmd_part.strip()
+                        reason = reason_part.strip()
+                    elif '| motivo:' in content:
+                        cmd_part, reason_part = content.split('| motivo:', 1)
+                        cmd_to_run = cmd_part.strip()
+                        reason = reason_part.strip()
+                    else:
+                        cmd_to_run = content
+
+                    if not cmd_to_run:
+                        console.print("[yellow]⚠️ Comando vacío ignorado.[/yellow]")
+                        # Eliminar bloque de la respuesta
+                        response_text = response_text.replace(full_block, "", 1)
+                        continue
+
+                    output, status = execute_command(cmd_to_run, reason)
+
+                    if status == 'modified':
+                        # El usuario quiere modificar el comando
+                        modification = console.input("[bold green]Describe la modificación que quieres:[/bold green] ").strip()
+                        if not modification:
+                            console.print("[yellow]Modificación cancelada, se ignora el comando.[/yellow]")
+                            response_text = response_text.replace(full_block, "", 1)
+                            continue
+                        fix_prompt = (
+                            f"El usuario rechazó el comando original y pidió esta modificación: {modification}\n"
+                            f"Comando original: {cmd_to_run}\n"
+                            "Responde SOLO con [COMANDO: comando_corregido | razon: razón]"
+                        )
+                        with console.status("[bold magenta]Reintentando...[/bold magenta]"):
+                            new_response = send_message_to_provider(chat, provider, fix_prompt)
+                        # Reemplazar el bloque original por la nueva respuesta
+                        response_text = response_text.replace(full_block, new_response, 1)
+                        continue
+
+                    if status in ('denied', 'sudo_rejected'):
+                        # Informar a la IA del rechazo explícito
+                        rejection_msg = (
+                            f"El usuario rechazó explícitamente la ejecución del comando: {cmd_to_run}\n"
+                            "No repitas este comando. Pregunta al usuario o propón una alternativa."
+                        )
+                        # Reemplazar el bloque por la salida de rechazo para que la IA lo vea
+                        response_text = response_text.replace(full_block, rejection_msg, 1)
+                        continue
+
+                    if status in ('executed', 'auto', 'cd'):
+                        # Enviar feedback a la IA
+                        feedback_msg = f"Salida del sistema para '{cmd_to_run}':\n```\n{output}\n```\nAhora responde a la petición original."
+                        # Reemplazar el bloque por el feedback
+                        response_text = response_text.replace(full_block, feedback_msg, 1)
+                        continue
+
+                elif script_match:
+                    full_block = script_match.group(0)
+                    content = script_match.group(1).strip()
+                    reason = ""
+                    if '| razon:' in content:
+                        script_part, reason_part = content.split('| razon:', 1)
+                        script_content = script_part.strip()
+                        reason = reason_part.strip()
+                    elif '| motivo:' in content:
+                        script_part, reason_part = content.split('| motivo:', 1)
+                        script_content = script_part.strip()
+                        reason = reason_part.strip()
+                    else:
+                        script_content = content
+
+                    if not script_content:
+                        console.print("[yellow]⚠️ Script vacío ignorado.[/yellow]")
+                        response_text = response_text.replace(full_block, "", 1)
+                        continue
+
+                    output, status = execute_script(script_content, reason)
+
+                    if status == 'modified':
+                        modification = console.input("[bold green]Describe la modificación que quieres para el script:[/bold green] ").strip()
+                        if not modification:
+                            console.print("[yellow]Modificación cancelada, se ignora el script.[/yellow]")
+                            response_text = response_text.replace(full_block, "", 1)
+                            continue
+                        fix_prompt = (
+                            f"El usuario rechazó el script original y pidió esta modificación: {modification}\n"
+                            f"Script original:\n{script_content}\n"
+                            "Responde SOLO con [SCRIPT: script_corregido | razon: razón]"
+                        )
+                        with console.status("[bold magenta]Reintentando...[/bold magenta]"):
+                            new_response = send_message_to_provider(chat, provider, fix_prompt)
+                        response_text = response_text.replace(full_block, new_response, 1)
+                        continue
+
+                    if status in ('denied', 'sudo_rejected'):
+                        rejection_msg = (
+                            f"El usuario rechazó explícitamente la ejecución del script.\n"
+                            "No repitas este script. Pregunta al usuario o propón una alternativa."
+                        )
+                        response_text = response_text.replace(full_block, rejection_msg, 1)
+                        continue
+
+                    if status in ('executed', 'auto'):
+                        feedback_msg = f"Salida del sistema para el script:\n```\n{output}\n```\nAhora responde a la petición original."
+                        response_text = response_text.replace(full_block, feedback_msg, 1)
+                        continue
+
+                else:
+                    # Si no se encontró ningún bloque, salimos
+                    break
+
+            # Mostrar la respuesta final
             if "NO TIENES CRÉDITOS" in response_text:
                 console.print(Panel(response_text, title=f"{provider.capitalize()} - ERROR", title_align="left", border_style="red"))
             else:
